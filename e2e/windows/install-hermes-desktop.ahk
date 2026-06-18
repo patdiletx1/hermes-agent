@@ -3,6 +3,8 @@
 
 logPath := A_Args.Length >= 1 ? A_Args[1] : "ahk.log"
 
+CoordMode("Mouse", "Screen")
+
 ClickWithMarker(x, y, button := "Left") {
     ToolTip(Format("Clicking at {1}, {2}", x, y))
 
