@@ -404,7 +404,7 @@ function Install-Uv {
         }
 
         $binDir = Join-Path $HermesHome "bin"
-        Write-Warn "uv not found at $managedUv; listing $binDir:"
+        Write-Warn "uv not found at $managedUv; listing $binDir :"
         if (Test-Path $binDir) {
             Get-ChildItem -Path $binDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
                 Write-Host "  $($_.FullName)" -ForegroundColor DarkGray
