@@ -272,15 +272,29 @@ def run_codex_app_server_turn(
     api_calls = 1
 
     # Now check the skill nudge AFTER iters were incremented — same
-    # pattern the chat_completions path uses (line ~15432).
+    # pattern the chat_completions path uses (line ~15432). Adaptive cadence
+    # (idea ④) mirrors agent/turn_finalizer.py: skip tool-free turns and back
+    # off the interval after consecutive no-op reviews.
     should_review_skills = False
-    if (
-        agent._skill_nudge_interval > 0
-        and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
-    ):
-        should_review_skills = True
-        agent._iters_since_skill = 0
+    if agent._skill_nudge_interval > 0 and "skill_manage" in agent.valid_tool_names:
+        from agent.background_review import (
+            effective_skill_interval as _eff_interval,
+            _read_skill_cadence as _read_cadence,
+        )
+        _cad = _read_cadence()
+        _turn_had_tools = bool(turn.tool_iterations) or any(
+            isinstance(_m, dict) and _m.get("tool_calls")
+            for _m in (messages or [])
+        )
+        _eff = _eff_interval(
+            agent._skill_nudge_interval,
+            int(getattr(agent, "_review_noop_streak", 0)),
+        )
+        if agent._iters_since_skill >= _eff and not (
+            _cad["skip_tool_free_turns"] and not _turn_had_tools
+        ):
+            should_review_skills = True
+            agent._iters_since_skill = 0
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.

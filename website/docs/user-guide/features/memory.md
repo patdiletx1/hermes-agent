@@ -266,6 +266,58 @@ display:
 > writes to your memory/skill stores, are unaffected by this setting. Set it
 > per-platform via `display.platforms.<platform>.memory_notifications`.
 
+## Cost of the background review (`auxiliary.background_review`, `skills` cadence)
+
+The self-improvement review is a forked agent that replays your recent
+conversation and decides whether to save a memory or patch a skill. By default
+it runs on your **main chat model** so it can reuse that conversation's warmed
+prompt cache. On a cheap main model that's the cheapest option; on an expensive
+reasoning model (e.g. a frontier GPT/Claude tier) every review pays full price
+for the replayed transcript, which adds up over a long session.
+
+Three knobs keep the review cheap without weakening what it learns:
+
+**Route the review to a cheap model.** Point it at a fast, inexpensive model —
+the same per-task plumbing every auxiliary task uses:
+
+```yaml
+auxiliary:
+  background_review:
+    provider: openrouter
+    model: google/gemini-3-flash-preview   # auto (default) = use the main chat model
+```
+
+When routed to a model other than your main one, the prompt-cache share is
+dropped (it would miss anyway) and the fork replays a trimmed context **digest**
+(recent turns verbatim + a summary of older ones) instead of the full
+transcript. In our A/B this cut per-review cost by roughly an order of magnitude
+with no measured loss in what the review correctly saved.
+
+**Bound the replayed context.** Even on the main model, a very large session is
+capped so a runaway transcript can't drive a huge review bill:
+
+```yaml
+auxiliary:
+  background_review:
+    max_context_tokens: 48000   # 0 = always replay the full snapshot
+    digest_tail_messages: 24    # recent turns kept verbatim when the digest engages
+```
+
+**Skip reviews that have nothing to learn.** Pure Q&A turns and long quiet
+stretches rarely produce a skill update, so the skill review backs off:
+
+```yaml
+skills:
+  creation_nudge_interval: 10   # tool iterations before a skill review (0 disables)
+  skip_tool_free_turns: true    # don't review turns that made zero tool calls
+  adaptive_backoff: true        # widen the interval after consecutive no-op reviews
+  adaptive_backoff_after: 3     # consecutive "nothing to save" before backing off
+```
+
+> Memory review keeps its own independent cadence (`memory.nudge_interval`,
+> default every 10 user prompts) — these `skills` knobs only govern the skill
+> side of the review.
+
 ## Controlling skill writes (`skills.write_approval`)
 
 Skills use the same on/off gate, but the review UX differs because a

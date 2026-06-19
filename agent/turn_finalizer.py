@@ -373,12 +373,33 @@ def finalize_turn(
     agent._stream_callback = None
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
+    # Adaptive cadence (idea ④):
+    #   • skip_tool_free_turns — a turn that made zero tool calls almost never
+    #     yields a skill update, so don't pay for the review fork on pure Q&A.
+    #   • effective_skill_interval — back off the interval after a run of
+    #     consecutive "Nothing to save." reviews (tracked on the parent agent
+    #     as ``_review_noop_streak``), so quiet sessions stop paying for no-op
+    #     forks. Memory review keeps its own independent counter/cadence.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
-            and agent._iters_since_skill >= agent._skill_nudge_interval
-            and "skill_manage" in agent.valid_tool_names):
-        _should_review_skills = True
-        agent._iters_since_skill = 0
+    if agent._skill_nudge_interval > 0 and "skill_manage" in agent.valid_tool_names:
+        from agent.background_review import (
+            effective_skill_interval as _eff_interval,
+            _read_skill_cadence as _read_cadence,
+        )
+        _cad = _read_cadence()
+        _turn_had_tools = any(
+            isinstance(_m, dict) and _m.get("tool_calls")
+            for _m in (messages or [])
+        )
+        _eff = _eff_interval(
+            agent._skill_nudge_interval,
+            int(getattr(agent, "_review_noop_streak", 0)),
+        )
+        if agent._iters_since_skill >= _eff and not (
+            _cad["skip_tool_free_turns"] and not _turn_had_tools
+        ):
+            _should_review_skills = True
+            agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(

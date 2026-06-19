@@ -1529,6 +1529,35 @@ DEFAULT_CONFIG = {
             "timeout": 60,
             "extra_body": {},
         },
+        # Background review — the post-turn self-improvement fork that decides
+        # whether to save a memory / patch a skill. "auto" = use the main chat
+        # model (the historical default; it reuses the parent's warmed
+        # system-prompt prefix cache, see PR #17276). Override to a cheap fast
+        # model (e.g. openrouter google/gemini-3-flash-preview) to cut the cost
+        # of this fork by ~10-30x on expensive main models. NOTE: when routed
+        # to a model OTHER than the parent's, the parent prefix-cache share is
+        # disabled (different cache key) and the fork replays a trimmed context
+        # digest instead of the full transcript — quality holds for the
+        # memory/skill filing task.
+        "background_review": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {},
+            # Token ceiling for the conversation snapshot replayed into the
+            # fork. Above this, the fork replays a compressed digest (recent
+            # tail verbatim + a summary of older turns) instead of the full
+            # transcript, bounding the pathological large-session case where an
+            # uncompressed snapshot drove ~296K input tokens in one incident.
+            # 0 disables the guard (always replay full snapshot).
+            "max_context_tokens": 48000,
+            # Verbatim tail size (messages) always kept when the digest path
+            # engages — the turn(s) that triggered the review must survive
+            # un-summarized so their signal isn't lost.
+            "digest_tail_messages": 24,
+        },
     },
     
     "display": {
@@ -2014,6 +2043,23 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Skill-review cadence for the post-turn self-improvement fork.
+        #   creation_nudge_interval — fire a skill review after this many tool
+        #     iterations accrue within a turn (0 disables skill review). Default
+        #     10. Also read in agent_init.py; declared here so it is documented
+        #     and discoverable in config.yaml.
+        #   skip_tool_free_turns — when true (default), skip the skill review on
+        #     turns that made zero tool calls. A pure Q&A turn with no actions
+        #     rarely yields a skill update, so the review fork is wasted spend.
+        #     Memory review still fires on its own counter.
+        #   adaptive_backoff — when true (default), after this many consecutive
+        #     reviews that returned "Nothing to save.", double the effective
+        #     interval (capped at 4x) so quiet sessions stop paying for no-op
+        #     forks. Any review that DOES save resets the backoff.
+        "creation_nudge_interval": 10,
+        "skip_tool_free_turns": True,
+        "adaptive_backoff": True,
+        "adaptive_backoff_after": 3,
     },
 
     # Curator — background skill maintenance.

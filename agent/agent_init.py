@@ -1131,6 +1131,10 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    # Consecutive "Nothing to save." background-review streak — drives the
+    # adaptive skill-review backoff (see agent.background_review). Reset to 0
+    # by any review that actually saves a memory/skill.
+    agent._review_noop_streak = 0
     if not skip_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})

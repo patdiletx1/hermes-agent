@@ -22,9 +22,289 @@ import contextlib
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary-model routing + context-budget helpers (cost reduction).
+#
+# The review fork historically ran on the parent's main model so it could
+# reuse the parent's warmed system-prompt prefix cache (PR #17276). That is
+# the cheapest path WHEN the user is on a cheap main model, but on an
+# expensive reasoning model (gpt-5.5, opus) every review pays full price for
+# the whole replayed transcript across up to 16 iterations.
+#
+# These helpers let a user route the review fork to a cheap aux model via
+# ``auxiliary.background_review.{provider,model}`` (same plumbing as the
+# curator and every other aux task). When routed OFF the parent model the
+# prefix-cache share is dropped (different cache key) and the replayed
+# context is trimmed to a digest, because the fork no longer benefits from
+# matching the parent's cached prefix and we want its input bounded.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
+    """Resolve provider/model/credentials for the background-review fork.
+
+    Returns a dict with keys: provider, model, api_key, base_url, api_mode,
+    routed (bool — True when routed to a model OTHER than the parent's main
+    model, which means the prefix-cache share must be dropped).
+
+    Precedence:
+      1. ``auxiliary.background_review.{provider,model}`` when provider is set
+         non-"auto" AND model is non-empty → route to that aux model.
+      2. Otherwise → inherit the parent's live runtime (historical behaviour),
+         preserving the codex_app_server → codex_responses downgrade so the
+         agent-loop tools dispatch.
+    """
+    # Parent live runtime — the historical default, and the fallback.
+    parent_runtime = agent._current_main_runtime()
+    parent_api_mode = parent_runtime.get("api_mode") or None
+    if parent_api_mode == "codex_app_server":
+        parent_api_mode = "codex_responses"
+    parent = {
+        "provider": agent.provider,
+        "model": agent.model,
+        "api_key": parent_runtime.get("api_key") or None,
+        "base_url": parent_runtime.get("base_url") or None,
+        "api_mode": parent_api_mode,
+        "routed": False,
+        "extra_body": None,
+    }
+
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        return parent
+
+    aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+    task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
+    task_provider = (str(task.get("provider", "")).strip() or None)
+    task_model = (str(task.get("model", "")).strip() or None)
+    task_base_url = (str(task.get("base_url", "")).strip() or None)
+    task_api_key = (str(task.get("api_key", "")).strip() or None)
+    extra_body = task.get("extra_body") if isinstance(task.get("extra_body"), dict) else None
+
+    # Only route when a concrete provider+model is configured. "auto" or an
+    # empty model means "use the main chat model" — keep the cache-share path.
+    if not (task_provider and task_provider != "auto" and task_model):
+        return parent
+
+    # If the configured aux model is byte-identical to the parent model on the
+    # same provider, there is no benefit to dropping the cache-share — treat it
+    # as the parent path.
+    same_as_parent = (
+        task_provider == (agent.provider or "")
+        and task_model == (agent.model or "")
+    )
+    if same_as_parent:
+        return parent
+
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        rp = resolve_runtime_provider(
+            requested=task_provider,
+            target_model=task_model,
+            explicit_api_key=task_api_key,
+            explicit_base_url=task_base_url,
+        )
+        return {
+            "provider": rp.get("provider") or task_provider,
+            "model": task_model,
+            "api_key": rp.get("api_key"),
+            "base_url": rp.get("base_url"),
+            "api_mode": rp.get("api_mode"),
+            "routed": True,
+            "extra_body": extra_body,
+        }
+    except Exception as e:
+        logger.debug(
+            "Background-review aux routing failed (%s); using main model", e,
+            exc_info=True,
+        )
+        return parent
+
+
+def _read_review_budget() -> Dict[str, int]:
+    """Read snapshot context-budget knobs from auxiliary.background_review."""
+    out = {"max_context_tokens": 48000, "digest_tail_messages": 24}
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+        task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
+        if isinstance(task.get("max_context_tokens"), int):
+            out["max_context_tokens"] = max(0, task["max_context_tokens"])
+        if isinstance(task.get("digest_tail_messages"), int):
+            out["digest_tail_messages"] = max(1, task["digest_tail_messages"])
+    except Exception:
+        pass
+    return out
+
+
+def _rough_token_count(messages: List[Dict]) -> int:
+    """Cheap char/2.75 token estimate over a message list (no tokenizer dep)."""
+    total = 0
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for block in c:
+                if isinstance(block, dict):
+                    t = block.get("text")
+                    if isinstance(t, str):
+                        total += len(t)
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    total += len(args)
+    return int(total / 2.75)
+
+
+def _digest_old_messages(old: List[Dict]) -> str:
+    """Summarise dropped older turns as a compact text digest (no LLM call).
+
+    Captures who-said-what and which tools ran so the review fork still sees
+    the arc of the conversation, just not verbatim. Deterministic and free —
+    the whole point is to avoid replaying (and paying for) the full history.
+    """
+    lines: List[str] = []
+    for m in old or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "user":
+            c = m.get("content")
+            text = c if isinstance(c, str) else ""
+            if isinstance(c, list):
+                text = " ".join(
+                    b.get("text", "") for b in c if isinstance(b, dict)
+                )
+            text = (text or "").strip().replace("\n", " ")
+            if text:
+                lines.append(f"USER: {text[:300]}")
+        elif role == "assistant":
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                names = [
+                    (tc.get("function") or {}).get("name", "?")
+                    for tc in tcs if isinstance(tc, dict)
+                ]
+                lines.append(f"ASSISTANT[tools: {', '.join(names)}]")
+            c = m.get("content")
+            text = c if isinstance(c, str) else ""
+            text = (text or "").strip().replace("\n", " ")
+            if text:
+                lines.append(f"ASSISTANT: {text[:200]}")
+    body = "\n".join(lines)
+    return (
+        "[Earlier conversation digest — older turns summarised to bound "
+        "review cost. Recent turns follow verbatim below.]\n" + body
+    )
+
+
+def _build_review_history(
+    messages_snapshot: List[Dict],
+    max_context_tokens: int,
+    digest_tail_messages: int,
+) -> Tuple[List[Dict], Dict[str, Any]]:
+    """Return the (possibly trimmed) conversation_history for the review fork.
+
+    When the snapshot is within budget (or the guard is disabled), the full
+    snapshot is returned unchanged. Otherwise the recent ``digest_tail_messages``
+    are kept verbatim and the older prefix is collapsed into a single synthetic
+    user-role digest message, preserving role alternation at the seam.
+
+    The second return value is metadata for logging/metrics.
+    """
+    full_tokens = _rough_token_count(messages_snapshot)
+    meta = {
+        "digested": False,
+        "full_tokens": full_tokens,
+        "replayed_tokens": full_tokens,
+        "full_messages": len(messages_snapshot or []),
+        "replayed_messages": len(messages_snapshot or []),
+    }
+    if max_context_tokens <= 0 or full_tokens <= max_context_tokens:
+        return list(messages_snapshot or []), meta
+
+    msgs = list(messages_snapshot or [])
+    if len(msgs) <= digest_tail_messages:
+        return msgs, meta
+
+    tail = msgs[-digest_tail_messages:]
+    # Don't open the verbatim tail on a `tool` message — that would orphan it
+    # from its assistant(tool_calls) parent and break alternation. Walk back to
+    # the nearest assistant or user boundary.
+    while tail and isinstance(tail[0], dict) and tail[0].get("role") == "tool":
+        digest_tail_messages += 1
+        if len(msgs) <= digest_tail_messages:
+            return msgs, meta
+        tail = msgs[-digest_tail_messages:]
+
+    old = msgs[:-len(tail)]
+    digest_msg = {"role": "user", "content": _digest_old_messages(old)}
+    history = [digest_msg] + tail
+    meta["digested"] = True
+    meta["replayed_tokens"] = _rough_token_count(history)
+    meta["replayed_messages"] = len(history)
+    return history, meta
+
+
+def _read_skill_cadence() -> Dict[str, Any]:
+    """Read skill-review cadence knobs from the skills config section."""
+    out = {
+        "skip_tool_free_turns": True,
+        "adaptive_backoff": True,
+        "adaptive_backoff_after": 3,
+    }
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        sk = cfg.get("skills", {}) if isinstance(cfg.get("skills"), dict) else {}
+        if isinstance(sk.get("skip_tool_free_turns"), bool):
+            out["skip_tool_free_turns"] = sk["skip_tool_free_turns"]
+        if isinstance(sk.get("adaptive_backoff"), bool):
+            out["adaptive_backoff"] = sk["adaptive_backoff"]
+        if isinstance(sk.get("adaptive_backoff_after"), int) and sk["adaptive_backoff_after"] > 0:
+            out["adaptive_backoff_after"] = sk["adaptive_backoff_after"]
+    except Exception:
+        pass
+    return out
+
+
+def effective_skill_interval(base_interval: int, noop_streak: int) -> int:
+    """Compute the backed-off skill-review interval for a quiet session.
+
+    Once ``noop_streak`` reaches ``adaptive_backoff_after`` consecutive
+    "Nothing to save." reviews, the effective interval grows (×2 per
+    additional whole multiple of the threshold) up to a 4× cap, so a session
+    that keeps producing nothing stops paying for no-op review forks. Any
+    review that saves resets the streak (see ``_run_review_in_thread``).
+    Returns ``base_interval`` unchanged when backoff is disabled or the
+    streak is below the threshold.
+    """
+    if base_interval <= 0:
+        return base_interval
+    cad = _read_skill_cadence()
+    if not cad["adaptive_backoff"]:
+        return base_interval
+    after = cad["adaptive_backoff_after"]
+    if noop_streak < after:
+        return base_interval
+    multiplier = min(4, 1 + (noop_streak // after))
+    return base_interval * multiplier
+
+
+# Module-level type import used by the helpers above.
 
 
 # Review-prompt strings — used by ``spawn_background_review_thread`` to build
@@ -488,18 +768,15 @@ def _run_review_in_thread(
             # creds, or credential-pool setups where the resolver can't
             # reconstruct auth from scratch -- producing the spurious
             # "No LLM provider configured" warning at end of turn.
-            _parent_runtime = agent._current_main_runtime()
-            _parent_api_mode = _parent_runtime.get("api_mode") or None
-            # The review fork needs to call agent-loop tools (memory,
-            # skill_manage). Those tools require Hermes' own dispatch,
-            # which the codex_app_server runtime bypasses entirely
-            # (it runs the turn inside codex's subprocess). So when
-            # the parent is on codex_app_server, downgrade the review
-            # fork to codex_responses — same auth/credentials, but
-            # talks to the OpenAI Responses API directly so Hermes
-            # owns the loop and the agent-loop tools dispatch.
-            if _parent_api_mode == "codex_app_server":
-                _parent_api_mode = "codex_responses"
+            #
+            # _resolve_review_runtime() returns the parent's live runtime by
+            # default (routed=False), or — when the user configured
+            # auxiliary.background_review.{provider,model} to a cheap aux model
+            # — that aux model's runtime (routed=True). The codex_app_server →
+            # codex_responses downgrade (so agent-loop tools dispatch) is
+            # applied inside the resolver for the parent path.
+            _rt = _resolve_review_runtime(agent)
+            _routed = bool(_rt.get("routed"))
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -519,14 +796,14 @@ def _run_review_in_thread(
             # in the request body — Anthropic's cache key includes it.
             # (The runtime whitelist below still restricts dispatch.)
             review_agent = AIAgent(
-                model=agent.model,
+                model=_rt.get("model") or agent.model,
                 max_iterations=16,
                 quiet_mode=True,
                 platform=agent.platform,
-                provider=agent.provider,
-                api_mode=_parent_api_mode,
-                base_url=_parent_runtime.get("base_url") or None,
-                api_key=_parent_runtime.get("api_key") or None,
+                provider=_rt.get("provider") or agent.provider,
+                api_mode=_rt.get("api_mode"),
+                base_url=_rt.get("base_url") or None,
+                api_key=_rt.get("api_key") or None,
                 credential_pool=getattr(agent, "_credential_pool", None),
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
@@ -565,15 +842,25 @@ def _run_review_in_thread(
             # issue #25322 and PR #17276 for the full analysis +
             # measured impact (~26% end-to-end cost reduction on
             # Sonnet 4.5).
-            review_agent._cached_system_prompt = agent._cached_system_prompt
-            # Defensive: pin session_start + session_id to the
-            # parent's so any code path that re-renders parts of
-            # the system prompt (compression, plugin hooks) still
-            # produces byte-identical output. The cached-prompt
-            # assignment above already short-circuits the normal
-            # rebuild path, but these pins guarantee parity even
-            # if a future code path bypasses the cache.
-            review_agent.session_start = agent.session_start
+            #
+            # ONLY share the parent prefix when the fork runs on the parent's
+            # model (the default "auto" path). When routed to a different aux
+            # model via auxiliary.background_review.{provider,model}, the
+            # parent's cached prompt is for the WRONG model/provider — the
+            # cache key would miss regardless, and worse, the system prompt
+            # carries model-specific guidance (tool enforcement, vendor
+            # self-identification) that doesn't belong to the aux model. Let
+            # the routed fork build its own correct system prompt.
+            if not _routed:
+                review_agent._cached_system_prompt = agent._cached_system_prompt
+                # Defensive: pin session_start + session_id to the
+                # parent's so any code path that re-renders parts of
+                # the system prompt (compression, plugin hooks) still
+                # produces byte-identical output. The cached-prompt
+                # assignment above already short-circuits the normal
+                # rebuild path, but these pins guarantee parity even
+                # if a future code path bypasses the cache.
+                review_agent.session_start = agent.session_start
             review_agent.session_id = agent.session_id
             # Never let the review fork compress. It shares the parent's
             # session_id, so if it won a compression race it would rotate the
@@ -608,6 +895,37 @@ def _run_review_in_thread(
                 ),
             )
             try:
+                # Build the conversation history to replay into the fork.
+                # - Routed to an aux model: the prefix-cache share is already
+                #   gone, so trimming to a digest is pure cost win.
+                # - Not routed (main-model path): keep the full snapshot so the
+                #   message-level prefix cache still hits — UNLESS the snapshot
+                #   blows past the hard token ceiling, in which case we digest
+                #   anyway to bound the pathological large-session case (the
+                #   ~296K-token incident this PR addresses). 0 disables.
+                _budget = _read_review_budget()
+                _max_ctx = _budget["max_context_tokens"]
+                _full_tokens = _rough_token_count(messages_snapshot)
+                _engage_digest = _routed or (
+                    _max_ctx > 0 and _full_tokens > _max_ctx
+                )
+                if _engage_digest:
+                    # Effective ceiling: the configured cap, or a sane default
+                    # when routed with the guard disabled (routing means the
+                    # cache-share is gone, so we always bound the replay).
+                    _eff_ctx = _max_ctx if _max_ctx > 0 else 48000
+                    _review_history, _digest_meta = _build_review_history(
+                        messages_snapshot, _eff_ctx, _budget["digest_tail_messages"],
+                    )
+                    logger.info(
+                        "bg-review context: routed=%s digested=%s "
+                        "full=%d→replayed=%d tokens (%d→%d msgs)",
+                        _routed, _digest_meta["digested"],
+                        _digest_meta["full_tokens"], _digest_meta["replayed_tokens"],
+                        _digest_meta["full_messages"], _digest_meta["replayed_messages"],
+                    )
+                else:
+                    _review_history = messages_snapshot
                 review_agent.run_conversation(
                     user_message=(
                         prompt
@@ -615,7 +933,7 @@ def _run_review_in_thread(
                         "management tools. Other tools will be denied "
                         "at runtime — do not attempt them."
                     ),
-                    conversation_history=messages_snapshot,
+                    conversation_history=_review_history,
                 )
             finally:
                 clear_thread_tool_whitelist()
@@ -650,6 +968,19 @@ def _run_review_in_thread(
             messages_snapshot,
             notification_mode=getattr(agent, "memory_notifications", "on"),
         )
+
+        # Adaptive cadence (idea ④): track the consecutive "Nothing to save."
+        # streak on the parent so the trigger logic can back off the review
+        # interval on quiet sessions. A review that DID save resets it.
+        try:
+            if actions:
+                agent._review_noop_streak = 0
+            else:
+                agent._review_noop_streak = (
+                    int(getattr(agent, "_review_noop_streak", 0)) + 1
+                )
+        except Exception:
+            pass
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
