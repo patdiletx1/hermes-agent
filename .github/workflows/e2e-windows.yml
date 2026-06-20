@@ -203,7 +203,6 @@ jobs:
             $ahkProc = Start-Process -FilePath ".\test-bins\autohotkey\AutoHotkey64.exe" `
               -ArgumentList "$env:INSTALL_DIR\e2e\windows\install-hermes-desktop.ahk", "$PWD\ahk.log" -PassThru -NoNewWindow `
               -ErrorStdOut
-              -RedirectStandardOutput ahk-stdout.log -RedirectStandardError ahk-stderr.log
 
             # Wait for AHK helper to finish. can take a long time for installer!
 
@@ -305,7 +304,7 @@ jobs:
 
           if ($x -ne $null -and $y -ne $null -and $w -ne $null -and $h -ne $null) {
             # Window border + 16px grid only over the window + axis labels
-            $grid = "drawbox=x=$x`:y=$y`:w=$w`:h=$h`:color=red@0.9:t=2,split=2[box][win];[win]crop=$w`:$h`:$x`:$y`:$y"
+            $grid = "drawbox=x=$x`:y=$y`:w=$w`:hf=$h`:color=red@0.9:t=2,split=2[box][win];[win]crop=$w`:$h`:$x`:$y`:$y"
           }
 
           Write-Host "Overlay filter: $vf"
