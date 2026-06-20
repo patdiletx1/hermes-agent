@@ -255,6 +255,36 @@ jobs:
           # Point the e2e spec at the desktop binary that the installer built.
           HERMES_E2E_INSTALL_ROOT: ${{ env.HERMES_HOME }}\hermes-agent
 
+      - name: Take final screenshot
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+
+          $screens = [System.Windows.Forms.Screen]::AllScreens
+          $top    = ($screens | ForEach-Object { $_.Bounds.Top }    | Measure-Object -Minimum).Minimum
+          $left   = ($screens | ForEach-Object { $_.Bounds.Left }   | Measure-Object -Minimum).Minimum
+          $width  = ($screens | ForEach-Object { $_.Bounds.Right }  | Measure-Object -Maximum).Maximum - $left
+          $height = ($screens | ForEach-Object { $_.Bounds.Bottom } | Measure-Object -Maximum).Maximum - $top
+
+          $bounds = [System.Drawing.Rectangle]::FromLTRB($left, $top, $left + $width, $top + $height)
+          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+
+          New-Item -ItemType Directory -Force -Path screenshots | Out-Null
+          $bitmap.Save("screenshot.png", [System.Drawing.Imaging.ImageFormat]::Png)
+
+          $graphics.Dispose()
+          $bitmap.Dispose()
+
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot
+          path: screenshot.png
+          if-no-files-found: error
+
       # ── Teardown & artifacts ────────────────────────────────────────
       # ffmpeg is normally started AND gracefully stopped inside the launch
       # step (so 'q' reaches its live stdin pipe). This step is only a
@@ -330,17 +360,6 @@ jobs:
           archive: false
           overwrite: true
 
-      - name: Link screen recording in job summary
-        if: always()
-        shell: pwsh
-        env:
-          MKV_URL: ${{ steps.upload-recording.outputs.artifact-url }}
-          GIF_URL: ${{ steps.upload-gif.outputs.artifact-url }}
-        run: |
-          Add-Content $env:GITHUB_STEP_SUMMARY "## Installer screen recording"
-          Add-Content $env:GITHUB_STEP_SUMMARY ""
-          Add-Content $env:GITHUB_STEP_SUMMARY "[download recording.mkv]($env:MKV_URL)"
-
       - name: Bootstrap Installer log
         if: always()
         shell: pwsh
@@ -352,33 +371,3 @@ jobs:
         shell: pwsh
         run: |
           Get-Content ahk.log
-
-      - name: Find latest screenshot (Windows Screenshots folder)
-        if: always()
-        id: latest
-        shell: pwsh
-        run: |
-          $folder = "$env:USERPROFILE\Pictures\Screenshots"
-
-          if (!(Test-Path $folder)) {
-            Write-Error "Screenshots folder not found: $folder"
-            exit 1
-          }
-
-          $files = Get-ChildItem -Path $folder -Filter "*.png" -File |
-                   Sort-Object LastWriteTime -Descending
-
-          if (-not $files) {
-            Write-Error "No screenshots found"
-            exit 1
-          }
-
-          $latest = $files[0].FullName
-          echo "file=$latest" >> $env:GITHUB_OUTPUT
-
-      - name: Upload artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: latest-screenshot
-          path: ${{ steps.latest.outputs.file }}
