@@ -332,6 +332,7 @@ jobs:
 
       - name: Link screen recording in job summary
         shell: pwsh
+        if: steps.upload-recording.conclusion == "success"
         env:
           MKV_URL: ${{ steps.upload-recording.outputs.artifact-url }}
           GIF_URL: ${{ steps.upload-gif.outputs.artifact-url }}
@@ -341,21 +342,25 @@ jobs:
           Add-Content $env:GITHUB_STEP_SUMMARY "[download recording.mkv]($env:MKV_URL)"
 
       - name: Bootstrap Installer log
+        if: always()
         shell: pwsh
         run: |
           Get-Content "$env:HERMES_HOME\logs\bootstrap-installer.log"
 
       - name: Autohotkey log
+        if: always()
         shell: pwsh
         run: |
           Get-Content ahk.log
 
       - name: Autohotkey stdout
+        if: always()
         shell: pwsh
         run: |
           Get-Content ahk-stdout.log
 
       - name: Autohotkey stderr
+        if: always()
         shell: pwsh
         run: |
           Get-Content ahk-stderr.log
