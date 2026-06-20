@@ -331,8 +331,8 @@ jobs:
           overwrite: true
 
       - name: Link screen recording in job summary
+        if: always()
         shell: pwsh
-        if: ${{ steps.upload-recording.conclusion == "success" }}
         env:
           MKV_URL: ${{ steps.upload-recording.outputs.artifact-url }}
           GIF_URL: ${{ steps.upload-gif.outputs.artifact-url }}
