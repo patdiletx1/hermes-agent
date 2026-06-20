@@ -67,7 +67,7 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
     {
         try
         {
-            if ImageSearch(&x, &y, wx, wy, wx + ww, wy + wh, Format("* {10}", imageFile))
+            if ImageSearch(&x, &y, wx, wy, wx + ww, wy + wh, imageFile)
             {
                 ClickWithMarker(x + Floor(width / 2), y + Floor(height / 2))
                 return
