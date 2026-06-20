@@ -51,11 +51,14 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
 {
     WinGetPos(&wx, &wy, &ww, &wh, winTitle)
 
-    pic := Gui()
-    ctrl := pic.AddPicture(, imageFile)
-    width := ctrl.Value.Width
-    height := ctrl.Value.Height
-    pic.Destroy()
+    hBitmap := LoadPicture(imageFile)
+
+    bm := Buffer(32, 0) ; BITMAP structure on x64
+    DllCall("GetObject", "Ptr", hBitmap, "Int", bm.Size, "Ptr", bm)
+
+    width := NumGet(bm, 4, "Int")
+    height := NumGet(bm, 8, "Int")
+
 
     startTime := A_TickCount
 
