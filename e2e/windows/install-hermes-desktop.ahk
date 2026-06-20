@@ -6,8 +6,8 @@ logPath := A_Args.Length >= 1 ? A_Args[1] : "ahk.log"
 
 Log(text) {
     ToolTip(text)
-    FileAppend(text, '*')
-    FileAppend(text, logPath)
+    FileAppend(Format("{}`n", text), '*')
+    FileAppend(Format("{}`n", text), logPath)
 }
 
 OnError(LogError)
