@@ -63,6 +63,8 @@ services:
   dashboard:
     image: hermes-agent
     container_name: hermes-dashboard
+    profiles:
+      - dashboard
     restart: unless-stopped
     network_mode: host
     depends_on:
