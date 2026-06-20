@@ -33,7 +33,7 @@ ClickWithMarker(x, y, button := "Left") {
     Click(x, y, button)
 
     Sleep(10)
-    ToolTip(Format("Clicking at {1}, {2}", x, y))
+    Log(Format("Clicking at {1}, {2}", x, y))
     size := 20
     g := Gui("-Caption +AlwaysOnTop +ToolWindow")
     g.BackColor := "Red"
@@ -87,7 +87,7 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
 
         Sleep intervalMs
         timeLeft := timeoutMs - (A_TickCount - startTime)
-        Log(Format("Searching for button {} in window {}...  {}s left", imageFile, winTitle, timeLeft / 1000))
+        Log(Format("Searching for button {} in window {}...  {}s left", imageFile, winTitle, Round(timeLeft / 1000, 2)))
     }
 
     throw Error(Format("Failed to find button {} in window {}", imageFile, winTitle))
@@ -99,8 +99,7 @@ winTitle := "Hermes"
 try {
     WinWait(winTitle, , 30)
 } catch {
-    Log("ERROR: Hermes installer window did not appear within 30s`n")
-    ExitApp(1)
+    throw Error("Hermes installer window did not appear within 30s")
 }
 WinGetPos(&x, &y, &w, &h, winTitle)
 Log(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h))
