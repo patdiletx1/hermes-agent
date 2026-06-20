@@ -204,8 +204,49 @@ jobs:
             $ahkProc = Start-Process -FilePath ".\test-bins\autohotkey\AutoHotkey64.exe" `
               -ArgumentList "$env:INSTALL_DIR\e2e\windows\install-hermes-desktop.ahk", "$PWD\ahk.log" -PassThru -NoNewWindow
 
-            # Wait for AHK helper to finish. can take a long time for installer!
-            $ahkProc | Wait-Process -Timeout (60 * 8) -ErrorAction SilentlyContinue
+            # Wait for AHK helper to finish, and tail logs.
+
+            $logReader  = $null
+            $logStream  = $null
+            # can take a long time for installer!
+            $deadline   = (Get-Date).AddSeconds(60 * 8)
+
+            try {
+              while ((Get-Date) -lt $deadline -and -not $ahkProc.HasExited) {
+                if (-not $logReader) {
+                  if (Test-Path $logPath) {
+                    Write-Host "Found bootstrap-installer.log; tailing..."
+                    # FileShare.ReadWrite is required: the installer almost
+                    # certainly still has the file open for writing, and a
+                    # plain Get-Content/File.Open would throw or lock it out.
+                    $logStream = [System.IO.File]::Open(
+                      $logPath, 'Open', 'Read', 'ReadWrite')
+                    $logReader = New-Object System.IO.StreamReader($logStream)
+                  }
+                } else {
+                  $line = $logReader.ReadLine()
+                  while ($null -ne $line) {
+                    Write-Host "[bootstrap] $line"
+                    $line = $logReader.ReadLine()
+                  }
+                }
+                Start-Sleep -Milliseconds 500
+              }
+
+              # Drain anything written in the final tick before exit/timeout.
+              if ($logReader) {
+                $line = $logReader.ReadLine()
+                while ($null -ne $line) {
+                  Write-Host "[bootstrap] $line"
+                  $line = $logReader.ReadLine()
+                }
+              }
+            }
+            finally {
+              if ($logReader) { $logReader.Dispose() }
+              if ($logStream) { $logStream.Dispose() }
+            }
+
             if (-not $ahkProc.HasExited) {
               Write-Host "AHK helper is still running; stopping it"
               Stop-Process -Id $ahkProc.Id -Force -ErrorAction SilentlyContinue
@@ -221,6 +262,7 @@ jobs:
               Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
             }
           }
+
           finally {
             # Gracefully stop ffmpeg by writing 'q' to its LIVE stdin pipe, so
             # the container header/index are finalized and the mkv is playable.
