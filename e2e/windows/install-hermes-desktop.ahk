@@ -47,7 +47,7 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
 
     startTime := A_TickCount
 
-    timeLeft := (A_TickCount - startTime) - timeoutMs
+    timeLeft := timeoutMs - (A_TickCount - startTime)
     while (timeLeft > 0)
     {
         try
@@ -60,7 +60,7 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
         }
 
         Sleep intervalMs
-        timeLeft := (A_TickCount - startTime) - timeoutMs
+        timeLeft := timeoutMs - (A_TickCount - startTime)
         ToolTip(Format("Searching for button {} in window {}...  {}s left", imageFile, winTitle, timeLeft / 1000))
     }
 

@@ -205,11 +205,12 @@ jobs:
               -ArgumentList "$env:INSTALL_DIR\e2e\windows\install-hermes-desktop.ahk", "$PWD\ahk.log" -PassThru -NoNewWindow -ErrorStdOut`
 
             # Wait for AHK helper to finish. can take a long time for installer!
-
             $ahkProc | Wait-Process -Timeout (60 * 8) -ErrorAction SilentlyContinue
             if (-not $ahkProc.HasExited) {
               Write-Host "AHK helper is still running; stopping it"
               Stop-Process -Id $ahkProc.Id -Force -ErrorAction SilentlyContinue
+            } else {
+              Write-Host "autohotkey helper exited"
             }
 
             # Installer should have exited
