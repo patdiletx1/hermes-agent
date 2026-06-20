@@ -700,6 +700,29 @@ def _profile_home(profile: str | None) -> Path | None:
     return home if (home / "state.db").exists() or home.exists() else None
 
 
+def _profile_scoped(handler):
+    """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
+
+    Pets are per-profile: ``display.pet.*`` lives in the profile's config.yaml and
+    sprites install under its ``pets/`` dir (both resolve via ``get_hermes_home``).
+    The desktop sends ``profile`` on pet calls so config + pets dir resolve to the
+    focused profile even in app-global remote mode, where one backend serves every
+    profile. No-op for the launch profile (own-profile backends already resolve it).
+    """
+
+    def wrapper(rid, params):
+        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        if home is None:
+            return handler(rid, params)
+        token = set_hermes_home_override(home)
+        try:
+            return handler(rid, params)
+        finally:
+            reset_hermes_home_override(token)
+
+    return wrapper
+
+
 # Placeholder ``terminal.cwd`` values that don't name a real directory — the
 # gateway resolves these to the home dir at runtime, so they must NOT be treated
 # as an explicit workspace (mirrors gateway/run.py's config bridge).
@@ -5225,6 +5248,7 @@ def _pet_state_rows(spritesheet) -> list[str]:
 
 
 @method("pet.info")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Return the active petdex pet for surfaces that render sprites.
 
@@ -5284,6 +5308,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.cells")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Return half-block cell frames for one pet state (TUI renderer).
 
@@ -5388,6 +5413,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.gallery")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """List adoptable pets for the desktop appearance picker.
 
@@ -5453,6 +5479,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.select")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Adopt a pet from the desktop picker: install (if needed) + activate.
 
@@ -5479,6 +5506,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.remove")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Uninstall a pet from the desktop picker (delete its on-disk directory).
 
@@ -5508,6 +5536,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.thumb")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Return a small idle-frame PNG (data URI) for one pet — the picker preview.
 
@@ -5542,6 +5571,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.disable")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Turn the pet off from the desktop picker (``display.pet.enabled=false``)."""
     try:
@@ -5555,6 +5585,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.scale")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Persist ``display.pet.scale`` from the desktop slider. Params: ``scale``.
 

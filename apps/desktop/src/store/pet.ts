@@ -1,5 +1,6 @@
 import { atom, computed } from 'nanostores'
 
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $busy } from '@/store/session'
 
 /**
@@ -83,6 +84,18 @@ export function derivePetState(activity: PetActivity): PetState {
 
 export const $petInfo = atom<PetInfo>({ enabled: false })
 export const $petActivity = atom<PetActivity>({})
+
+/**
+ * Profile the pet RPCs should resolve against. Pets are per-profile — the active
+ * pet (`display.pet.*`) and the installed sprites live under each profile's
+ * HERMES_HOME — so every pet RPC carries this. The gateway no-ops it for the
+ * launch profile (own-profile backends already resolve it) and rebinds for any
+ * other profile, which is what makes per-profile pets work in app-global remote
+ * mode (one backend serving every profile).
+ */
+export function petProfile(): string {
+  return normalizeProfileKey($activeGatewayProfile.get())
+}
 
 /**
  * Pet-local "you have a new message" flag, surfaced as the overlay's mail icon.

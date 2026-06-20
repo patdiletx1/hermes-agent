@@ -3,8 +3,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { persistString, storedString } from '@/lib/storage'
-import { $petInfo, clearPetUnread, type PetInfo, setPetInfo } from '@/store/pet'
+import { $petInfo, clearPetUnread, type PetInfo, petProfile, setPetInfo } from '@/store/pet'
+import { resetPetGallery } from '@/store/pet-gallery'
 import { $petOverlayActive, initPetOverlayBridge, popOutPet, restorePetOverlay } from '@/store/pet-overlay'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
 import { isSecondaryWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
@@ -103,7 +105,7 @@ export function FloatingPet() {
 
     const pull = async () => {
       try {
-        const next = await requestGateway<PetInfo>('pet.info')
+        const next = await requestGateway<PetInfo>('pet.info', { profile: petProfile() })
 
         if (!cancelled && next) {
           setPetInfo(next)
@@ -121,6 +123,26 @@ export function FloatingPet() {
       window.clearInterval(timer)
     }
   }, [gatewayState, active, requestGateway])
+
+  // Pets are per-profile. When the active profile changes, drop the previous
+  // profile's mascot + gallery cache so the poll above refetches the new
+  // profile's pet (its config + pets dir resolve per-profile on the backend).
+  const profileRef = useRef(normalizeProfileKey($activeGatewayProfile.get()))
+  useEffect(
+    () =>
+      $activeGatewayProfile.subscribe(next => {
+        const key = normalizeProfileKey(next)
+
+        if (key === profileRef.current) {
+          return
+        }
+
+        profileRef.current = key
+        setPetInfo({ enabled: false })
+        resetPetGallery()
+      }),
+    []
+  )
 
   // Wire the overlay control channel once, only in the primary window — the
   // pop-out overlay belongs to it (main.cjs positions it against the main

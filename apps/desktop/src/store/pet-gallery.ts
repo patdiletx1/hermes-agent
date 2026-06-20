@@ -1,6 +1,6 @@
 import { atom } from 'nanostores'
 
-import { $petInfo, type PetInfo, setPetInfo } from '@/store/pet'
+import { $petInfo, type PetInfo, petProfile, setPetInfo } from '@/store/pet'
 
 /**
  * Feature store for the petdex gallery picker (Cmd+K "Pets…" + Settings).
@@ -41,6 +41,12 @@ export type PetGalleryStatus = 'idle' | 'loading' | 'ready' | 'stale' | 'error'
  *  store reuses the hook's reconnect/reauth handling instead of duplicating it. */
 export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 
+/** Profile-scoped pet RPC. Pets are per-profile, so every call carries the active
+ *  profile (the gateway no-ops it for the launch profile). One chokepoint so no
+ *  call site can forget it. */
+const petRpc = <T>(request: GatewayRequest, method: string, params: Record<string, unknown> = {}): Promise<T> =>
+  request<T>(method, { ...params, profile: petProfile() })
+
 /** A JSON-RPC "method not found" — the backend predates the pet RPCs. */
 function isMissingMethod(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
@@ -62,11 +68,26 @@ export const $petBusy = atom<string | null>(null)
 const thumbCache = new Map<string, Promise<string | null>>()
 let galleryLoad: Promise<void> | null = null
 
+/**
+ * Drop the cached gallery, thumbnails, and in-flight load so the next open
+ * refetches against the now-active profile's backend. Called on a profile switch
+ * (pets are per-profile) — the floating pet's own `pet.info` poll repaints the
+ * new profile's mascot, and the picker reloads its gallery on next mount.
+ */
+export function resetPetGallery(): void {
+  galleryLoad = null
+  thumbCache.clear()
+  $petGallery.set(null)
+  $petGalleryStatus.set('idle')
+  $petGalleryError.set(null)
+  $petBusy.set(null)
+}
+
 export function loadPetThumb(request: GatewayRequest, slug: string, url?: string): Promise<string | null> {
   let pending = thumbCache.get(slug)
 
   if (!pending) {
-    pending = request<{ ok: boolean; dataUri?: string }>('pet.thumb', { slug, url: url ?? '' })
+    pending = petRpc<{ ok: boolean; dataUri?: string }>(request, 'pet.thumb', { slug, url: url ?? '' })
       .then(result => (result?.ok && result.dataUri ? result.dataUri : null))
       .catch(() => null)
     thumbCache.set(slug, pending)
@@ -95,7 +116,10 @@ export function loadPetGallery(request: GatewayRequest, options: { force?: boole
     }
 
     try {
-      const [next, info] = await Promise.all([request<PetGallery>('pet.gallery'), request<PetInfo>('pet.info')])
+      const [next, info] = await Promise.all([
+        petRpc<PetGallery>(request, 'pet.gallery'),
+        petRpc<PetInfo>(request, 'pet.info')
+      ])
 
       if (next) {
         $petGallery.set(next)
@@ -127,7 +151,7 @@ export function loadPetGallery(request: GatewayRequest, options: { force?: boole
 // network gallery — the floating pet repaints, the picker keeps its cache.
 async function syncInfo(request: GatewayRequest): Promise<void> {
   try {
-    const info = await request<PetInfo>('pet.info')
+    const info = await petRpc<PetInfo>(request, 'pet.info')
 
     if (info) {
       setPetInfo(info)
@@ -202,7 +226,7 @@ async function mutate(
 /** Install (if needed) + activate a pet. Optimistically marks it active. */
 export function adoptPet(request: GatewayRequest, slug: string, fallback: string): Promise<boolean> {
   return mutate(slug, fallback, request, async () => {
-    await request('pet.select', { slug })
+    await petRpc(request, 'pet.select', { slug })
     patchGallery(g => ({
       ...g,
       enabled: true,
@@ -241,9 +265,9 @@ export function setPetEnabled(
 
   return mutate(on ? TOGGLE_ON : TOGGLE_OFF, copy.fallback, request, async () => {
     if (on) {
-      await request('pet.select', { slug })
+      await petRpc(request, 'pet.select', { slug })
     } else {
-      await request('pet.disable')
+      await petRpc(request, 'pet.disable')
     }
 
     patchGallery(g => ({ ...g, enabled: on, active: on ? slug : g.active }))
@@ -272,7 +296,7 @@ export function setPetScale(request: GatewayRequest, scale: number): void {
 
   clearTimeout(scalePersist)
   scalePersist = setTimeout(() => {
-    request<{ ok: boolean; scale?: number }>('pet.scale', { scale: next })
+    petRpc<{ ok: boolean; scale?: number }>(request, 'pet.scale', { scale: next })
       .then(result => {
         // Reconcile with the server's clamp (cheap; only matters at the bounds).
         if (typeof result?.scale === 'number' && result.scale !== $petInfo.get().scale) {
@@ -288,7 +312,7 @@ export function setPetScale(request: GatewayRequest, scale: number): void {
 /** Uninstall a pet; turns the mascot off if it was the active one. */
 export function removePet(request: GatewayRequest, slug: string, fallback: string): Promise<boolean> {
   return mutate(slug, fallback, request, async () => {
-    await request('pet.remove', { slug })
+    await petRpc(request, 'pet.remove', { slug })
     patchGallery(g => ({
       ...g,
       enabled: g.active === slug ? false : g.enabled,
