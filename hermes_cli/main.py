@@ -300,6 +300,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.tenant_onboard import build_tenant_onboard_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -11589,6 +11590,40 @@ def cmd_claw(args):
     claw_command(args)
 
 
+def cmd_tenant_onboard(args):
+    """Auto-generate semantic mapping for a tenant database.
+
+    Connects to the tenant database via the central RDS registry,
+    extracts the schema, sends it to an LLM for business-name
+    inference, and persists the mapping.
+    """
+    import asyncio
+    from hermes_cli.tenant_onboard import run_tenant_onboard, TenantOnboardError
+
+    try:
+        result = asyncio.run(run_tenant_onboard(
+            tenant_id=args.tenant_id,
+            llm_provider=getattr(args, "llm_provider", None),
+            llm_model=getattr(args, "llm_model", None),
+            dry_run=getattr(args, "dry_run", False),
+        ))
+    except TenantOnboardError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if result.semantic_mapping is not None:
+        print(f"\nTenant {result.tenant_id} onboarded successfully.")
+        print(f"  Tables: {result.table_count}")
+        print(f"  Columns: {result.column_count}")
+        print(f"  Mapping persisted: {result.inserted}")
+        if result.semantic_mapping.get("description"):
+            print(f"  Description: {result.semantic_mapping['description']}")
+    else:
+        print(f"\nTenant {result.tenant_id} — schema inspection complete (dry-run).")
+        print(f"  Tables: {result.table_count}")
+        print(f"  Columns: {result.column_count}")
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -12441,6 +12476,11 @@ def main():
     # claw command  (parser built in hermes_cli/subcommands/claw.py)
     # =========================================================================
     build_claw_parser(subparsers, cmd_claw=cmd_claw)
+
+    # =========================================================================
+    # tenant-onboard command  (parser built in hermes_cli/subcommands/tenant_onboard.py)
+    # =========================================================================
+    build_tenant_onboard_parser(subparsers, cmd_tenant_onboard=cmd_tenant_onboard)
 
     # =========================================================================
     # version command  (parser built in hermes_cli/subcommands/version.py)

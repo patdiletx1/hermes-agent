@@ -3047,6 +3047,7 @@ class SlackAdapter(BasePlatformAdapter):
                     chat_type="dm" if str(channel_id or "").startswith("D") else "group",
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
+                    channel_user_id=normalized_user_id or str(channel_id or ""),
                 )
                 return bool(auth_fn(source))
             except Exception:
@@ -3609,6 +3610,7 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_type="group",
                 user_id=user_id,
                 thread_id=thread_ts,
+                channel_user_id=user_id or channel_id,
             )
 
             # Read session isolation settings from the store's config

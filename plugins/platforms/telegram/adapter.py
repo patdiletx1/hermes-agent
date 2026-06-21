@@ -579,6 +579,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
                     thread_id=str(thread_id) if thread_id is not None else None,
+                    channel_user_id=str(chat_id or normalized_user_id),
                 )
                 return bool(auth_fn(source))
             except Exception:

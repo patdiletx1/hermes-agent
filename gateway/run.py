@@ -54,6 +54,13 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
+from gateway.tenant_router import (
+    TenantRouter,
+    TenantState,
+    _convert_tenant_history_to_conversation,
+    initialize_tenant_system,
+    shutdown_tenant_system,
+)
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -2466,6 +2473,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
+
+        # Multi-tenant routing (initialized lazily in start())
+        self._tenant_router: Optional[TenantRouter] = None
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -5668,7 +5678,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
-        
+
+        # Initialize multi-tenant routing (no-op when HERMES_CENTRAL_DB_URL is unset)
+        self._tenant_router = await initialize_tenant_system()
+        if self._tenant_router is not None:
+            logger.info("Tenant routing enabled — central DB pool active")
+
         # Build initial channel directory for send_message name resolution
         try:
             from gateway.channel_directory import build_channel_directory
@@ -6668,6 +6683,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 shutdown_cached_clients()
             except Exception as _e:
                 logger.debug("shutdown_cached_clients error: %s", _e)
+
+            # Drain the central RDS tenant pool before closing session DBs.
+            await shutdown_tenant_system()
+            self._tenant_router = None
 
             # Close SQLite session DBs so the WAL write lock is released.
             # Without this, --replace and similar restart flows leave the
@@ -8786,6 +8805,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_key": session_key,
             })
         
+        # ── Tenant resolution (no-op when HERMES_CENTRAL_DB_URL is unset) ──
+        tenant_state = TenantState()
+        if self._tenant_router is not None:
+            try:
+                channel_id = source.channel_user_id or source.chat_id
+                ctx = await self._tenant_router.resolve_tenant(
+                    channel_id,
+                    source.platform.value if source.platform else "",
+                )
+                if ctx is not None:
+                    tenant_state.ctx = ctx
+                    await self._tenant_router.open_tenant_connection(ctx)
+            except Exception:
+                logger.debug(
+                    "Tenant resolution failed for channel_user_id=%s — "
+                    "falling back to single-user mode",
+                    source.channel_user_id or source.chat_id,
+                    exc_info=True,
+                )
+                # Fail-open: continue without tenant context
+
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
@@ -8804,7 +8844,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
-        
+
+        # Prepend tenant-specific business rules + semantic mapping
+        if tenant_state.ctx is not None and self._tenant_router is not None:
+            try:
+                tenant_block = self._tenant_router.build_tenant_system_prompt_block(
+                    tenant_state.ctx
+                )
+                context_prompt = tenant_block + "\n\n" + context_prompt
+            except Exception:
+                logger.debug(
+                    "Failed to build tenant system prompt block for tenant=%s",
+                    tenant_state.ctx.tenant_id,
+                    exc_info=True,
+                )
+
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
@@ -8907,7 +8961,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
-        
+
+        # Override with tenant chat_history when available
+        if tenant_state.ctx is not None and self._tenant_router is not None:
+            try:
+                channel_id = source.channel_user_id or source.chat_id
+                tenant_history = await self._tenant_router.query_chat_history(
+                    tenant_state.ctx, channel_id,
+                )
+                if tenant_history:
+                    history = _convert_tenant_history_to_conversation(tenant_history)
+                    logger.debug(
+                        "Loaded %d chat_history rows from tenant DB for %s",
+                        len(tenant_history), tenant_state.ctx.tenant_id,
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to load tenant chat_history — using local transcript",
+                    exc_info=True,
+                )
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #
@@ -9961,6 +10034,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            # Close tenant DB connection and wipe decrypted credentials
+            if tenant_state.ctx is not None and self._tenant_router is not None:
+                try:
+                    await self._tenant_router.close_tenant_connection()
+                except Exception:
+                    logger.debug(
+                        "Error closing tenant connection", exc_info=True,
+                    )
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 

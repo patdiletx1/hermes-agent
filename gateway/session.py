@@ -97,6 +97,12 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+    # Platform-specific stable identifier for multi-tenant routing.
+    # Set by each platform adapter at SessionSource construction time.
+    # Telegram → chat_id, WhatsApp → phone number, Discord → author.id.
+    # Used by TenantRouter.resolve_tenant() to look up the tenant link
+    # in the central AWS RDS channel_links table.
+    channel_user_id: Optional[str] = None
     
     @property
     def description(self) -> str:
@@ -142,6 +148,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.channel_user_id:
+            d["channel_user_id"] = self.channel_user_id
         return d
 
     @classmethod
@@ -161,6 +169,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            channel_user_id=data.get("channel_user_id"),
         )
     
 
